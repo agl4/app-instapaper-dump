@@ -13,6 +13,7 @@ import re
 import sqlite3
 import sys
 import time
+import unicodedata
 import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
@@ -256,10 +257,17 @@ def fetch_image(folder: Path, url: str):
 # ---------- export ----------
 
 
+# letters that don't decompose into base letter + accent
+_UNACCENT = str.maketrans({"ß": "ss", "æ": "ae", "œ": "oe", "ø": "o", "ł": "l", "đ": "d", "ð": "d", "þ": "th", "ı": "i"})
+
+
 def safe(s, cap=80):
-    s = re.sub(r'[/\\:*?"<>|\x00-\x1f\x7f]', "-", s or "")
-    s = re.sub(r"-{2,}", "-", re.sub(r"\s+", "-", s))
-    return s[:cap].strip(".-") or "untitled"
+    """Lower-case, accent-free, dash-separated: 'Árvíztűrő: Tükör!' -> 'arvizturo-tukor'."""
+    s = unicodedata.normalize("NFKD", (s or "").lower().translate(_UNACCENT))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    # ponytail: non-Latin scripts (CJK, Cyrillic) are kept as letters, not transliterated
+    s = re.sub(r"[\W_]+", "-", s)
+    return s[:cap].strip("-") or "untitled"
 
 
 def iso(ts):
@@ -299,7 +307,7 @@ def export(db, data: Path, out: Path):
                 # ponytail: a folder titled home/archive/liked merges with those dirs; prefix it if that ever happens
                 location = safe(folders.get(b["folder_id"]) or str(b["folder_id"]))
             dirs = [f"{location}/{year}"] + ([f"liked/{year}"] if b.get("liked") else [])
-            stem = f"{(iso(b.get('time')) or '1970-01-01T00:00:00Z')[:19].replace(':', '-')}_{safe(b.get('title'))}"
+            stem = f"{(iso(b.get('time')) or '1970-01-01T00:00:00Z')[:19].replace(':', '-').lower()}_{safe(b.get('title'))}"
             if any((d, stem) in used for d in dirs):
                 stem += f"_{bid}"
             used.update((d, stem) for d in dirs)

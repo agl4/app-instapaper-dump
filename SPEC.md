@@ -84,10 +84,11 @@ EXPORT_DIR/…/<year>/<name>_files/<img>     the article's images, copied alongs
   archived bookmarks go to `archive/`. If the API still returns a `folder_id` for an archived
   bookmark, `archived` wins.
 - `<year>` is the year of the saved time (`time`, UTC).
-- `<name>` = `2014-03-01T10-22-00_<safe title>`. The saved time is UTC ISO with `:` replaced by `-`.
-  The safe title replaces `/\:*?"<>|` and control characters with `-`, collapses whitespace to `-`,
-  trims dots and dashes, keeps unicode letters (so Hungarian accents survive), caps at 80 chars, and
-  falls back to `untitled`. If two files collide (same second, same title), `_<id>` is appended.
+- `<name>` = `2014-03-01t10-22-00_<safe title>`. The saved time is UTC ISO, lower-cased, with `:`
+  replaced by `-`. The safe title is lower-cased and accent-free (`Árvíztűrő` → `arvizturo`, plus
+  `ß→ss`, `ø→o`, `ł→l`…). Every run of non-alphanumerics becomes a single `-`, it is capped at 80 chars,
+  and it falls back to `untitled`. Non-Latin scripts are kept, not transliterated. If two files
+  collide (same second, same title), `_<id>` is appended.
 - The folder dir name uses the same sanitizer.
   `# ponytail:` a folder named "home"/"archive"/"liked" would merge with those dirs; prefix if it ever happens.
 
@@ -126,7 +127,7 @@ Instapaper, export filters, tag dirs.
     diff line and sets `deleted_at`. A sync interrupted mid-paging resumes at the saved offset.
     A 429 with `Retry-After` gets retried.
   - Export with one liked article in folder "Tech" and a fake image produces
-    `Tech/2014/2014-…_Title.md` and `liked/2014/…`, each with a `_files/` image and a relative
+    `tech/2014/2014-…_title.md` and `liked/2014/…`, each with a `_files/` image and a relative
     `![](…_files/…)` link, and a front-matter `images` entry mapping that file to its URL.
     A second export writes nothing (checked via file mtimes). Deleted bookmarks are not exported.
 - Live: `INSTAPAPER_TOKEN=… uv run ipdump sync --max-articles 5`, then `uv run ipdump export`,

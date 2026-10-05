@@ -107,8 +107,8 @@ def test_export(env):
     out = tmp / "export"
     assert ipdump.export(db, tmp / "data", out) == 4  # 2 md + 2 images
 
-    name = "2014-03-01T10-22-00_My-Title"
-    for d in ("Tech/2014", "liked/2014"):
+    name = "2014-03-01t10-22-00_my-title"
+    for d in ("tech/2014", "liked/2014"):
         md = (out / d / f"{name}.md").read_text()
         assert f"![]({name}_files/abc.jpg)" in md
         assert '  abc.jpg: "https://ex.com/pic.jpg"' in md
@@ -170,5 +170,6 @@ def test_main_ctrl_c_exit_code(tmp_path, monkeypatch):
 
 
 def test_safe():
-    assert ipdump.safe('  a/b: "Árvíztűrő"  tükör ') == "a-b-Árvíztűrő-tükör"
+    assert ipdump.safe('  a/b: "Árvíztűrő"  Tükör ') == "a-b-arvizturo-tukor"
+    assert ipdump.safe("Straße_Øl — Łódź?!") == "strasse-ol-lodz"
     assert ipdump.safe("...") == "untitled"
