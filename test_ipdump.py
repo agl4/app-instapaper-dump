@@ -18,11 +18,12 @@ def bm(id, title, **kw):
 
 
 class FakeAPI:
-    """Serves a list of changed bookmarks paged by offset, plus folders and parse."""
+    """Serves the change feed (paged by offset), section lists, folders and parse."""
 
-    def __init__(self, bookmarks, deleted=(), folders=()):
+    def __init__(self, bookmarks, deleted=(), folders=(), lists=None):
         self.items = [("b", b) for b in bookmarks] + [("d", d) for d in deleted]
         self.folders, self.offsets, self.statuses, self.fail_at = list(folders), [], [], None
+        self.lists, self.list_calls, self.list_fail_at = lists or {}, [], None  # {"home": [...], "9": [...]}
 
     def __call__(self, req):
         if self.statuses:
@@ -35,6 +36,13 @@ class FakeAPI:
             bid = url.path.split("/")[-2]
             body = {"metadata": {"author": {"name": "Ann"}},
                     "content": {"body": f'<h1>A{bid}</h1><p><img src="/pic{bid}.jpg"></p>', "images": [], "words": 3}}
+        elif "since" not in q:
+            key = q.get("folder_id") or q.get("section", "home")
+            off, items = int(q["offset"]), self.lists.get(key, [])
+            if (key, off) == self.list_fail_at:
+                raise InstapaperConnectionError("boom")
+            self.list_calls.append((key, off))
+            body = {"bookmarks": items[off:off + int(q["limit"])], "total": len(items)}
         else:
             off = int(q["offset"])
             if off == self.fail_at:
@@ -91,6 +99,28 @@ def test_sync_diff_delete_resume(env, capsys):
     run(api)
     assert api.offsets == [2]
     assert db.execute("select count(*) from bookmarks").fetchone()[0] == 6
+
+
+def test_full_import_reads_every_list_and_resumes(env, capsys):
+    db, run, _, _ = env
+    lists = {"home": [bm(1, "H1"), bm(2, "H2"), bm(3, "H3")],
+             "archive": [bm(4, "A", archived=True)],
+             "9": [bm(5, "F", folder_id=9, liked=True)]}
+    api = FakeAPI([], folders=[{"id": 9, "title": "Tech"}], lists=lists)
+    api.list_fail_at = ("home", 2)
+    with pytest.raises(InstapaperConnectionError):
+        run(api, max_articles=0)
+    api.list_fail_at, api.list_calls = None, []
+    c = run(api, max_articles=1)
+    assert api.list_calls == [("home", 2), ("archive", 0), ("9", 0)]  # resumed mid-home
+    assert db.execute("select count(*) from bookmarks").fetchone()[0] == 5
+    assert c["articles"] == 1 and db.execute("select bookmark_id from content").fetchone()[0] == 5  # liked first
+    out = capsys.readouterr().out
+    assert "  folder 'Tech': 1/1" in out and "+ 1 " not in out  # progress per page, no line per bookmark
+
+    api.list_calls = []
+    run(api, max_articles=0)
+    assert api.list_calls == []  # only once; later syncs use the change feed
 
 
 def test_rate_limit_retry(env):

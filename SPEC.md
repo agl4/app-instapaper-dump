@@ -10,7 +10,9 @@ The repo is empty (README only).
 Facts from the spec and SDK source (verified):
 - `GET /bookmarks?since=<ts>` returns every change across the whole account plus `deleted_ids`.
   The limit is ≤ 500; paging uses `offset += len(bookmarks)+len(deleted_ids)` and stops on a short page.
-  `since=1` returns the full account, so the initial import uses the same code as the incremental one.
+  The docs say `since=1` returns the whole account, but in practice the feed only holds bookmarks
+  with recorded changes (on a ~24k account it returned 1,325, almost all saved 2025–26). So the
+  first sync is a full import over the section lists instead (see Sync step 0).
 - SDK `client.bookmarks.changes(since, limit, offset)` fetches one page. Use it instead of `sync()`,
   which buffers the whole account in memory and can't resume.
 - Bookmarks have no `updated_at`, so changes are detected by diffing against the stored JSON.
@@ -43,7 +45,8 @@ Data dir: `~/.local/share/ipdump/` (`--data`), containing `instapaper.db` and `i
 - `images(url PK, file, error)`: `file` is the name `<sha256(url)[:16]>.<ext>`. The file lives on
   disk, not in the DB, sharded squid-style as `images/<ab>/<cd>/<abcd…>.<ext>` (first two hex pairs),
   so no directory holds more than a few files even for hundreds of thousands of images.
-- `state(key PK, value)`: `since`, `pending_since`, `pending_offset`, `pending_started`
+- `state(key PK, value)`: `since`, `pending_since`, `pending_offset`, `pending_started`,
+  `import_done`, `import_started`, `import_index`, `import_offset`
 
 ## Sync: `uv run ipdump sync [--max-articles N] [--delay LO HI]`
 **Throttled transport** wraps the SDK's `urllib_transport`. Before each API request it sleeps for
@@ -51,6 +54,12 @@ Data dir: `~/.local/share/ipdump/` (`--data`), containing `instapaper.db` and `i
 or backs off exponentially up to 300 s, for at most ~6 tries. After that it returns the response so
 the SDK raises the typed error.
 
+0. **Full import (once).** Until `import_done` is set, page through `GET /bookmarks?section=home`,
+   `section=archive`, and `folder_id=<id>` for every folder, 500 at a time, driven by `total`. Every
+   bookmark is in exactly one of these lists; liked is just a flag. Each page is one transaction and
+   the position (`import_index/offset`) is saved, so it resumes. It prints one progress line per page
+   (`home: 1500/12034`), not one per bookmark. On a fresh DB, `since` is then set to the import start
+   minus 60 s so the feed only fetches changes made during the import.
 1. **Metadata.** Resume from `pending_since/offset` if set. Otherwise use `since = state.since or 1`
    and record the start time. Commit each page of `changes(...)` in its own transaction: upsert the
    raw JSON and print one line per new or changed bookmark (the top-level keys that differ, e.g.

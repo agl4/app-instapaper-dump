@@ -127,6 +127,7 @@ def sync(db, data: Path, client, throttle: Throttle, max_articles=200):
     # Every page/article/image is its own transaction, so Ctrl-C loses at most the item in flight.
     counts = Counter()
     try:
+        full_import(db, client, throttle, counts)
         sync_meta(db, client, throttle, counts)
         sync_missing_images(db, data, counts)
         sync_articles(db, data, client, throttle, max_articles, counts)
@@ -174,6 +175,13 @@ def sync_meta(db, client, throttle, counts):
             put(db, pending_offset=offset)
         if len(raw) + len(page.deleted_ids) < PAGE:
             break
+    refresh_folders(db, client, throttle)
+    with db:
+        db.execute("delete from state where key like 'pending_%'")
+        put(db, since=max(1, started - 60))  # overlap for clock skew
+
+
+def refresh_folders(db, client, throttle):
     log("Folders: refreshing")
     client.folders.list()
     with db:
@@ -182,11 +190,50 @@ def sync_meta(db, client, throttle, counts):
             "insert into folders(id, json) values (?, ?)",
             [(f["id"], json.dumps(f, sort_keys=True)) for f in throttle.last.get("folders") or []],
         )
-        db.execute("delete from state where key like 'pending_%'")
-        put(db, since=max(1, started - 60))  # overlap for clock skew
 
 
-def upsert(db, b, counts):
+def full_import(db, client, throttle, counts):
+    """One-time import of every bookmark by paging home, archive and each folder.
+
+    The `since` change feed only returns bookmarks with recorded changes (in practice ~2025 on),
+    not the whole account, so the first sync reads every list; later syncs use the feed.
+    Every bookmark is in exactly one of these lists; liked is just a flag.
+    """
+    if get(db, "import_done"):
+        return
+    if get(db, "import_started") is None:
+        refresh_folders(db, client, throttle)
+        with db:
+            put(db, import_started=int(time.time()), import_index=0, import_offset=0)
+    titles = {fid: json.loads(j).get("title") for fid, j in db.execute("select id, json from folders")}
+    lists = [("home", None, "home"), ("archive", None, "archive")] + [
+        ("folder", fid, f"folder {title!r}") for fid, title in sorted(titles.items())
+    ]
+    index, offset = get(db, "import_index"), get(db, "import_offset")
+    log(f"Full import: reading {len(lists)} lists (home, archive, {len(lists) - 2} folders)"
+        + (f", resuming at {lists[index][2] if index < len(lists) else 'end'} {offset}" if index or offset else ""))
+    # ponytail: offset paging over a live list can skip an item if one is added/moved mid-import;
+    # the change feed afterwards catches anything that changed, not items that merely shifted
+    while index < len(lists):
+        section, folder_id, name = lists[index]
+        page = client.bookmarks.list(section=section, folder_id=folder_id, limit=PAGE, offset=offset)
+        raw = throttle.last.get("bookmarks") or []
+        with db:
+            for bookmark in raw:
+                upsert(db, bookmark, counts, quiet=True)
+            offset += len(raw)
+            log(f"  {name}: {offset}/{page.total}")
+            if len(raw) < PAGE or offset >= page.total:
+                index, offset = index + 1, 0
+            put(db, import_index=index, import_offset=offset)
+    with db:
+        if get(db, "since") is None:  # first ever sync: the feed only needs changes made during the import
+            put(db, since=max(1, get(db, "import_started") - 60))
+        db.execute("delete from state where key like 'import_%'")
+        put(db, import_done=1)
+
+
+def upsert(db, b, counts, quiet=False):
     new = json.dumps(b, sort_keys=True)
     row = db.execute("select json, deleted_at from bookmarks where id = ?", (b["id"],)).fetchone()
     if row and row[0] == new and row[1] is None:
@@ -194,7 +241,8 @@ def upsert(db, b, counts):
     title = b.get("title") or ""
     if row is None:
         counts["new"] += 1
-        log(f'+ {b["id"]} "{title}"')
+        if not quiet:
+            log(f'+ {b["id"]} "{title}"')
     else:
         old = json.loads(row[0])
         diff = [f"{k} {_short(old.get(k))}→{_short(b.get(k))}" for k in sorted(old | b) if old.get(k) != b.get(k)]
