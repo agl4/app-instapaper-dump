@@ -50,7 +50,7 @@ uv run ipdump export --out ~/Notes/instapaper
 ```
 
 Run `sync` as often as you like (e.g. daily from cron). Each run only fetches what changed, and an
-interrupted run resumes where it stopped. Repeat `export` runs only write files that changed. The
+interrupted run (Ctrl-C, crash, network loss) resumes where it stopped. Repeat `export` runs only write files that changed. The
 export never deletes anything, so to drop articles you deleted, unliked or moved, delete the
 export directory and export again.
 

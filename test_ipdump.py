@@ -121,6 +121,54 @@ def test_export(env):
     assert mtimes == {p: p.stat().st_mtime_ns for p in mtimes}
 
 
+def test_ctrl_c_keeps_progress(env, monkeypatch, capsys):
+    db, run, _, tmp = env
+    api = FakeAPI([bm(1, "One"), bm(2, "Two"), bm(3, "Three")])
+    send = api.__call__
+    calls = []
+
+    def interrupt_second_parse(req):
+        if req.url.split("?")[0].endswith("/parse"):
+            calls.append(req.url)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+        return send(req)
+
+    with pytest.raises(KeyboardInterrupt):
+        run(interrupt_second_parse)
+    assert "+3 new" in capsys.readouterr().out  # summary still printed
+    assert db.execute("select count(*) from content").fetchone()[0] == 1
+    assert run(api)["articles"] == 2  # resumes with the rest
+
+    out = tmp / "export"
+    real = ipdump.atomic_write
+    n = []
+
+    def interrupt_third_write(path, payload):
+        n.append(path)
+        if len(n) == 3:
+            raise KeyboardInterrupt
+        real(path, payload)
+
+    monkeypatch.setattr(ipdump, "atomic_write", interrupt_third_write)
+    with pytest.raises(KeyboardInterrupt):
+        ipdump.export(db, tmp / "data", out)
+    monkeypatch.setattr(ipdump, "atomic_write", real)
+    assert len(json.loads((out / ".ipdump-manifest").read_text())) == 2
+    assert not list(out.rglob("*.part"))
+    assert ipdump.export(db, tmp / "data", out) == 4  # 3 md + 1 image left, done ones skipped
+
+
+def test_main_ctrl_c_exit_code(tmp_path, monkeypatch):
+    def boom(*a):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ipdump, "export", boom)
+    with pytest.raises(SystemExit) as e:
+        ipdump.main(["export", "--data", str(tmp_path)])
+    assert e.value.code == 130
+
+
 def test_safe():
     assert ipdump.safe('  a/b: "Árvíztűrő"  tükör ') == "a-b-Árvíztűrő-tükör"
     assert ipdump.safe("...") == "untitled"

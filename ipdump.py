@@ -10,7 +10,6 @@ import mimetypes
 import os
 import random
 import re
-import shutil
 import sqlite3
 import sys
 import time
@@ -95,11 +94,26 @@ def put(db, **values):
 # ---------- sync ----------
 
 
+def atomic_write(path: Path, payload: bytes):
+    """Write via a temp file so an interrupt never leaves a half-written file behind."""
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_bytes(payload)
+    os.replace(tmp, path)
+
+
 def sync(db, data: Path, client, throttle: Throttle, max_articles=200):
+    # Every page/article/image is its own transaction, so Ctrl-C loses at most the item in flight.
     counts = Counter()
-    sync_meta(db, client, throttle, counts)
-    sync_articles(db, client, throttle, max_articles, counts)
-    sync_images(db, data, counts)
+    try:
+        sync_meta(db, client, throttle, counts)
+        sync_articles(db, client, throttle, max_articles, counts)
+        sync_images(db, data, counts)
+    finally:
+        summary(db, counts)
+    return counts
+
+
+def summary(db, counts):
     left, liked = db.execute(
         "select count(*), coalesce(sum(json_extract(b.json, '$.liked')), 0) from bookmarks b"
         " left join content c on c.bookmark_id = b.id where b.deleted_at is null and c.bookmark_id is null"
@@ -108,7 +122,6 @@ def sync(db, data: Path, client, throttle: Throttle, max_articles=200):
         f"+{counts['new']} new, ~{counts['changed']} changed, -{counts['deleted']} deleted, "
         f"{counts['articles']} articles, {counts['images']} images ({left:,} articles remaining, {liked} liked)"
     )
-    return counts
 
 
 def sync_meta(db, client, throttle, counts):
@@ -236,7 +249,7 @@ def fetch_image(folder: Path, url: str):
         suffix if re.fullmatch(r"\.[a-z0-9]{1,5}", suffix) else ".bin"
     )
     name = hashlib.sha256(url.encode()).hexdigest()[:16] + ext
-    (folder / name).write_bytes(body)
+    atomic_write(folder / name, body)
     return name, None
 
 
@@ -257,54 +270,52 @@ def export(db, data: Path, out: Path):
     folders = {fid: json.loads(j).get("title") for fid, j in db.execute("select id, json from folders")}
     files = dict(db.execute("select url, file from images where file is not null"))
     manifest_path = out / ".ipdump-manifest"
-    old = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    new, used, written, count = {}, set(), 0, 0
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    used, written, count = set(), 0, 0
 
-    def write(rel, payload: bytes, digest):
+    def write(rel, payload: bytes | Path, digest):
         nonlocal written
-        new[rel] = digest
         path = out / rel
-        if old.get(rel) == digest and path.exists():
+        if manifest.get(rel) == digest and path.exists():
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(payload, Path):
-            shutil.copyfile(payload, path)
-        else:
-            path.write_bytes(payload)
+        atomic_write(path, payload.read_bytes() if isinstance(payload, Path) else payload)
+        manifest[rel] = digest  # only after the file is fully in place
         written += 1
 
     rows = db.execute(
         "select b.id, b.json, c.json from bookmarks b left join content c on c.bookmark_id = b.id"
         " where b.deleted_at is null order by b.id"
     )
-    for bid, bj, cj in rows:
-        b, parsed = json.loads(bj), json.loads(cj) if cj else None
-        year = datetime.fromtimestamp(b.get("time") or 0, timezone.utc).year
-        if b.get("archived"):
-            location = "archive"
-        elif b.get("folder_id") is None:
-            location = "home"
-        else:
-            # ponytail: a folder titled home/archive/liked merges with those dirs; prefix it if that ever happens
-            location = safe(folders.get(b["folder_id"]) or str(b["folder_id"]))
-        dirs = [f"{location}/{year}"] + ([f"liked/{year}"] if b.get("liked") else [])
-        stem = f"{(iso(b.get('time')) or '1970-01-01T00:00:00Z')[:19].replace(':', '-')}_{safe(b.get('title'))}"
-        if any((d, stem) in used for d in dirs):
-            stem += f"_{bid}"
-        used.update((d, stem) for d in dirs)
+    try:
+        for bid, bj, cj in rows:
+            b, parsed = json.loads(bj), json.loads(cj) if cj else None
+            year = datetime.fromtimestamp(b.get("time") or 0, timezone.utc).year
+            if b.get("archived"):
+                location = "archive"
+            elif b.get("folder_id") is None:
+                location = "home"
+            else:
+                # ponytail: a folder titled home/archive/liked merges with those dirs; prefix it if that ever happens
+                location = safe(folders.get(b["folder_id"]) or str(b["folder_id"]))
+            dirs = [f"{location}/{year}"] + ([f"liked/{year}"] if b.get("liked") else [])
+            stem = f"{(iso(b.get('time')) or '1970-01-01T00:00:00Z')[:19].replace(':', '-')}_{safe(b.get('title'))}"
+            if any((d, stem) in used for d in dirs):
+                stem += f"_{bid}"
+            used.update((d, stem) for d in dirs)
 
-        text, images = render(b, parsed, stem, folders, files)
-        payload = text.encode()
-        digest = hashlib.sha256(payload).hexdigest()
-        for d in dirs:
-            write(f"{d}/{stem}.md", payload, digest)
-            for f in images:
-                write(f"{d}/{stem}_files/{f}", data / "images" / f, f)
-        count += 1
-
-    out.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(new, indent=0, sort_keys=True))
-    print(f"exported {count} articles, wrote {written} files to {out}")
+            text, images = render(b, parsed, stem, folders, files)
+            payload = text.encode()
+            digest = hashlib.sha256(payload).hexdigest()
+            for d in dirs:
+                write(f"{d}/{stem}.md", payload, digest)
+                for f in images:
+                    write(f"{d}/{stem}_files/{f}", data / "images" / f, f)
+            count += 1
+    finally:  # also on Ctrl-C, so the next run skips what's already written
+        out.mkdir(parents=True, exist_ok=True)
+        atomic_write(manifest_path, json.dumps(manifest, indent=0, sort_keys=True).encode())
+        print(f"exported {count} articles, wrote {written} files to {out}")
     return written
 
 
@@ -369,12 +380,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     db = open_db(args.data)
-    if args.cmd == "sync":
-        token = os.environ.get("INSTAPAPER_TOKEN") or parser.error("set INSTAPAPER_TOKEN")
-        throttle = Throttle(tuple(args.delay))
-        sync(db, args.data, Instapaper(token, transport=throttle), throttle, args.max_articles)
-    else:
-        export(db, args.data, args.out)
+    try:
+        if args.cmd == "sync":
+            token = os.environ.get("INSTAPAPER_TOKEN") or parser.error("set INSTAPAPER_TOKEN")
+            throttle = Throttle(tuple(args.delay))
+            sync(db, args.data, Instapaper(token, transport=throttle), throttle, args.max_articles)
+        else:
+            export(db, args.data, args.out)
+    except KeyboardInterrupt:
+        print("interrupted; progress is saved, run again to continue", file=sys.stderr)
+        sys.exit(130)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
