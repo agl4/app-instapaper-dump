@@ -92,8 +92,17 @@ def _retry_after(headers):
         return None
 
 
+def image_path(data: Path, name: str) -> Path:
+    """Squid-style cache layout: images/3f/9a/3f9a1c0b7d2e4a51.jpg (256 x 256 dirs)."""
+    return data / "images" / name[:2] / name[2:4] / name
+
+
 def open_db(data: Path) -> sqlite3.Connection:
     (data / "images").mkdir(parents=True, exist_ok=True)
+    for old in (data / "images").glob("*.*"):  # one-time move from the old flat layout
+        if old.is_file():
+            image_path(data, old.name).parent.mkdir(parents=True, exist_ok=True)
+            os.replace(old, image_path(data, old.name))
     db = sqlite3.connect(data / "instapaper.db")
     db.executescript(SCHEMA)
     return db
@@ -278,7 +287,7 @@ def fetch_article_images(db, data, parsed, b, counts):
            if not db.execute("select 1 from images where url = ?", (u,)).fetchone()]
     failed = 0
     for url in new:
-        file, error = fetch_image(data / "images", url)
+        file, error = fetch_image(data, url)
         with db:
             db.execute("insert into images values (?, ?, ?)", (url, file, error))
         counts["images"] += 1
@@ -301,8 +310,8 @@ def sync_missing_images(db, data, counts):
             log(f"  catch-up {_title(b)}: {done}")
 
 
-def fetch_image(folder: Path, url: str):
-    """Download to folder/<sha256(url)[:16]>.<ext>. Returns (file, None) or (None, error)."""
+def fetch_image(data: Path, url: str):
+    """Download to image_path(<sha256(url)[:16]>.<ext>). Returns (file name, None) or (None, error)."""
     try:
         request = urllib.request.Request(url, headers={"User-Agent": UA})
         with urllib.request.urlopen(request, timeout=30) as r:
@@ -314,7 +323,9 @@ def fetch_image(folder: Path, url: str):
         suffix if re.fullmatch(r"\.[a-z0-9]{1,5}", suffix) else ".bin"
     )
     name = hashlib.sha256(url.encode()).hexdigest()[:16] + ext
-    atomic_write(folder / name, body)
+    path = image_path(data, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, body)
     return name, None
 
 
@@ -385,7 +396,7 @@ def export(db, data: Path, out: Path):
             for d in dirs:
                 write(f"{d}/{stem}.md", payload, digest)
                 for f in images:
-                    write(f"{d}/{stem}_files/{f}", data / "images" / f, f)
+                    write(f"{d}/{stem}_files/{f}", image_path(data, f), f)
             count += 1
             if count % 500 == 0:
                 log(f"  {count}/{len(rows)}, {written} files written")

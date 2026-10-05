@@ -51,9 +51,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(ipdump.time, "sleep", sleeps.append)
     monkeypatch.setattr(ipdump, "PAGE", 2)
 
-    def fake_fetch(folder, url):
+    def fake_fetch(data, url):
         name = "abc.jpg"
-        (folder / name).write_bytes(b"jpg")
+        ipdump.image_path(data, name).parent.mkdir(parents=True, exist_ok=True)
+        ipdump.image_path(data, name).write_bytes(b"jpg")
         return name, None
 
     monkeypatch.setattr(ipdump, "fetch_image", fake_fetch)
@@ -196,6 +197,14 @@ def test_safe():
     assert ipdump.safe('  a/b: "Árvíztűrő"  Tükör ') == "a-b-arvizturo-tukor"
     assert ipdump.safe("Straße_Øl — Łódź?!") == "strasse-ol-lodz"
     assert ipdump.safe("...") == "untitled"
+
+
+def test_image_layout_migrates_flat_files(tmp_path):
+    (tmp_path / "images").mkdir()
+    (tmp_path / "images" / "3f9a1c0b7d2e4a51.jpg").write_bytes(b"x")
+    ipdump.open_db(tmp_path)
+    assert (tmp_path / "images/3f/9a/3f9a1c0b7d2e4a51.jpg").read_bytes() == b"x"
+    assert not (tmp_path / "images" / "3f9a1c0b7d2e4a51.jpg").exists()
 
 
 def test_language():

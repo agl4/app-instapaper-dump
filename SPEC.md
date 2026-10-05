@@ -40,7 +40,9 @@ Data dir: `~/.local/share/ipdump/` (`--data`), containing `instapaper.db` and `i
 - `bookmarks(id PK, json, deleted_at)`: the raw bookmark object from the change feed
 - `content(bookmark_id PK, json, fetched_at, error)`: the raw parse response
 - `folders(id PK, json)`
-- `images(url PK, file, error)`: the file lives in `images/<sha256(url)[:16]>.<ext>` on disk, not in the DB
+- `images(url PK, file, error)`: `file` is the name `<sha256(url)[:16]>.<ext>`. The file lives on
+  disk, not in the DB, sharded squid-style as `images/<ab>/<cd>/<abcd…>.<ext>` (first two hex pairs),
+  so no directory holds more than a few files even for hundreds of thousands of images.
 - `state(key PK, value)`: `since`, `pending_since`, `pending_offset`, `pending_started`
 
 ## Sync: `uv run ipdump sync [--max-articles N] [--delay LO HI]`
