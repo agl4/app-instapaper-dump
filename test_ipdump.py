@@ -196,3 +196,11 @@ def test_safe():
     assert ipdump.safe('  a/b: "Árvíztűrő"  Tükör ') == "a-b-arvizturo-tukor"
     assert ipdump.safe("Straße_Øl — Łódź?!") == "strasse-ol-lodz"
     assert ipdump.safe("...") == "untitled"
+
+
+def test_language():
+    assert ipdump.language("The quick brown fox jumps over the lazy dog and runs into the forest.") == "en"
+    assert ipdump.language("Árvíztűrő tükörfúrógép, a magyar nyelv nagyon szép és gazdag.") == "hu"
+    assert ipdump.language("Der schnelle braune Fuchs springt über den faulen Hund.") == "de"
+    assert ipdump.language("Le renard brun rapide saute par-dessus le chien paresseux.") == "fr"
+    assert ipdump.language(" 1234 ") is None

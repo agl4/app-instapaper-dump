@@ -25,6 +25,8 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from instapaper import Instapaper
 from instapaper._transport import decode_body, urllib_transport
+import langdetect.detector_factory as langdetect_factory
+from langdetect import DetectorFactory, LangDetectException
 from instapaper.errors import (
     BadRequestError,
     NotFoundError,
@@ -36,6 +38,8 @@ from markdownify import markdownify
 
 PAGE = 500
 UA = "Mozilla/5.0 (ipdump)"
+# languages the user reads, most likely first: a prior that only tips close calls; others still detectable
+LANGUAGE_PRIOR = {"en": 8, "hu": 4, "de": 2}
 CATEGORIES = {0: "article", 1: "email", 2: "video", 3: "pdf", 4: "social"}
 SCHEMA = """
 create table if not exists bookmarks(id integer primary key, json text not null, deleted_at integer);
@@ -392,6 +396,22 @@ def export(db, data: Path, out: Path):
     return written
 
 
+def language(text):
+    """ISO 639-1 code of the text (e.g. 'hu'), or None if it can't be told."""
+    if not text.strip():
+        return None
+    DetectorFactory.seed = 0  # deterministic, so re-exports don't flip-flop
+    langdetect_factory.init_factory()  # loads profiles once
+    factory = langdetect_factory._factory
+    detector = factory.create()
+    detector.set_prior_map({lang: LANGUAGE_PRIOR.get(lang, 1) for lang in factory.get_lang_list()})
+    detector.append(text[:10000])
+    try:
+        return detector.detect()
+    except LangDetectException:
+        return None
+
+
 def render(b, parsed, stem, folders, files):
     """Markdown text for one bookmark, plus {local file: original url} of the images it links."""
     meta = parsed.get("metadata") or {}
@@ -425,6 +445,7 @@ def render(b, parsed, stem, folders, files):
         "folder": folders.get(b.get("folder_id")),
         "tags": [t.get("name") for t in b.get("tags") or []],
         "category": CATEGORIES.get(category, category),
+        "language": language(f"{b.get('title') or ''}\n{soup.get_text(' ')}"),
         "words": content.get("words"),
         "paywalled": content.get("paywalled"),
         "private_source": b.get("private_source"),

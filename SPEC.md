@@ -100,8 +100,11 @@ EXPORT_DIR/…/<year>/<name>_files/<img>     the article's images, copied alongs
 **File contents.**
 - YAML front-matter holds all the metadata the API gives: id, url, title, author, author_url,
   description, image, saved, published, progress, progress_at, liked, archived, folder, tags (names),
-  category, words, paywalled, private_source, images. Values are written with `json.dumps(v)`, since
+  category, language, words, paywalled, private_source, images. Values are written with `json.dumps(v)`, since
   JSON is valid YAML, so PyYAML isn't needed.
+- `language` is the ISO 639-1 code detected from title + body text with `langdetect` (seeded, so
+  stable across exports), with a prior of en > hu > de that only tips close calls; any of its 55
+  languages can still come out. `null` if undetectable.
 - `images` maps each local file in `_files/` back to its original URL, so the exported article
   stands alone without the DB. It is built from the `images` table and written as a block mapping
   in body order (key = sha file name, value = `json.dumps(url)`). Images that failed to download
