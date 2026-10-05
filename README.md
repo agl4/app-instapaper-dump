@@ -5,7 +5,7 @@ Mirror your Instapaper account locally and export it as plain Markdown files wit
 - **sync** incrementally downloads bookmark metadata, article text and images into a local SQLite
   database. It is throttled (random 1–6 s between API calls, backoff on rate limits) and resumable,
   and it prints what changed since the last run. Liked articles are fetched first.
-- **export** writes one Markdown file per article, with YAML front matter and images alongside,
+- **export** writes one Markdown file per article that has its full text synced, with YAML front matter and images alongside,
   mirroring Instapaper: `home/`, `archive/`, one dir per folder, plus copies of liked articles in
   `liked/`, each grouped by year.
 
@@ -50,7 +50,8 @@ uv run ipdump export --out ~/Notes/instapaper
 ```
 
 Run `sync` as often as you like (e.g. daily from cron). Each run only fetches what changed, and an
-interrupted run (Ctrl-C, crash, network loss) resumes where it stopped. Repeat `export` runs only write files that changed. The
+interrupted run (Ctrl-C, crash, network loss) resumes where it stopped. Ctrl-C lets the
+current article finish (text + images) before stopping; press it twice to stop immediately. Repeat `export` runs only write files that changed. The
 export never deletes anything, so to drop articles you deleted, unliked or moved, delete the
 export directory and export again.
 

@@ -62,14 +62,19 @@ the SDK raises the typed error.
    200, `0` = all), calling `parse(id)` and storing the raw JSON.
    A 400 or 404 is recorded in `error` and skipped. A 402 or exhausted 429 stops cleanly, and the
    next run resumes. If a bookmark's `url` changes, its content row is deleted so it gets re-parsed.
-3. **Images.** For each content row, in the same liked-first order, download every URL in `content.images` plus `<img src>` in the
-   body that isn't already in `images`. This uses plain `urllib` to the third-party hosts with a 30 s
-   timeout and no API throttling. Failures are recorded in `error` and not retried.
+3. **Images, per article.** Right after an article's text is stored, its images are downloaded
+   (every URL in `content.images` plus `<img src>` in the body that isn't already in `images`), so
+   each step leaves a complete article. This uses plain `urllib` to the third-party hosts with a 30 s
+   timeout and no API throttling. Failures are recorded in `error` and not retried. Before fetching
+   new articles, a catch-up pass downloads images that an interrupted run left behind.
+   **Ctrl-C** during an article is held until its text and images are stored, then sync stops;
+   a second Ctrl-C aborts at once (the catch-up pass covers that case).
 
 The summary line looks like `+12 new, ~5 changed, -1 deleted, 30 articles, 211 images (4,210 articles remaining, 37 liked)`.
 
 ## Export: `uv run ipdump export [--out EXPORT_DIR]` (default `./export`). The main feature.
-Reads only from SQLite and `images/`, with no API calls. Deleted bookmarks are excluded.
+Reads only from SQLite and `images/`, with no API calls. Only bookmarks with full article text are
+exported; deleted bookmarks and ones whose text isn't synced yet (or failed to parse) are skipped.
 
 **Directories.** These mirror Instapaper. Each article goes into exactly one location dir, plus
 a copy in `liked/` if it's liked:
@@ -107,8 +112,7 @@ EXPORT_DIR/…/<year>/<name>_files/<img>     the article's images, copied alongs
     a07c55e1b2f9d830.png: "https://example.com/chart.png"
   ```
 - Body: rewrite `<img src>` in the HTML to `<name>_files/<file>` for every downloaded image, then
-  run `markdownify`. Images that haven't been downloaded keep their remote URL. Bookmarks without
-  content yet get `description` plus `_(article text not synced yet)_`.
+  run `markdownify`. Images that haven't been downloaded keep their remote URL.
 
 **Re-export.** The export only adds and updates files. It never deletes anything. To get a clean
 export (after deletions, unlikes, or moves), delete `EXPORT_DIR` yourself and export again.
@@ -129,7 +133,7 @@ Instapaper, export filters, tag dirs.
   - Export with one liked article in folder "Tech" and a fake image produces
     `tech/2014/2014-…_title.md` and `liked/2014/…`, each with a `_files/` image and a relative
     `![](…_files/…)` link, and a front-matter `images` entry mapping that file to its URL.
-    A second export writes nothing (checked via file mtimes). Deleted bookmarks are not exported.
+    A second export writes nothing (checked via file mtimes). Deleted bookmarks and ones without text are not exported.
 - Live: `INSTAPAPER_TOKEN=… uv run ipdump sync --max-articles 5`, then `uv run ipdump export`,
   then open a liked article's .md in a Markdown viewer to check that the images render offline.
   Rerun sync: expect `0 changed`.

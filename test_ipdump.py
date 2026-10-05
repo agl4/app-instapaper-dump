@@ -1,4 +1,5 @@
 import json
+import signal
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -33,7 +34,7 @@ class FakeAPI:
         elif url.path.endswith("/parse"):
             bid = url.path.split("/")[-2]
             body = {"metadata": {"author": {"name": "Ann"}},
-                    "content": {"body": f'<h1>A{bid}</h1><p><img src="/pic.jpg"></p>', "images": [], "words": 3}}
+                    "content": {"body": f'<h1>A{bid}</h1><p><img src="/pic{bid}.jpg"></p>', "images": [], "words": 3}}
         else:
             off = int(q["offset"])
             if off == self.fail_at:
@@ -69,7 +70,7 @@ def test_sync_diff_delete_resume(env, capsys):
     db, run, _, _ = env
     api = FakeAPI([bm(1, "One"), bm(2, "Two"), bm(3, "Three")])
     c = run(api)
-    assert (c["new"], c["articles"], c["images"]) == (3, 3, 1)  # same image url in every article
+    assert (c["new"], c["articles"], c["images"]) == (3, 3, 3)
     assert api.offsets == [0, 2]
 
     api = FakeAPI([bm(1, "One", liked=True)], deleted=[2])
@@ -102,8 +103,9 @@ def test_rate_limit_retry(env):
 def test_export(env):
     db, run, _, tmp = env
     tech = [{"id": 9, "title": "Tech"}]
-    run(FakeAPI([bm(1, "My: Title?", liked=True, folder_id=9), bm(2, "Gone")], folders=tech))
+    run(FakeAPI([bm(1, "My: Title?", liked=True, folder_id=9), bm(2, "Gone"), bm(3, "No text")], folders=tech))
     run(FakeAPI([], deleted=[2], folders=tech))
+    db.execute("delete from content where bookmark_id = 3")  # as if not fetched yet
     out = tmp / "export"
     assert ipdump.export(db, tmp / "data", out) == 4  # 2 md + 2 images
 
@@ -111,10 +113,11 @@ def test_export(env):
     for d in ("tech/2014", "liked/2014"):
         md = (out / d / f"{name}.md").read_text()
         assert f"![]({name}_files/abc.jpg)" in md
-        assert '  abc.jpg: "https://ex.com/pic.jpg"' in md
+        assert '  abc.jpg: "https://ex.com/pic1.jpg"' in md
         assert 'folder: "Tech"' in md and 'author: "Ann"' in md
         assert (out / d / f"{name}_files/abc.jpg").read_bytes() == b"jpg"
-    assert not list(out.rglob("*Gone*"))
+    assert not list(out.rglob("*gone*"))
+    assert not list(out.rglob("*no-text*"))
 
     mtimes = {p: p.stat().st_mtime_ns for p in out.rglob("*") if p.is_file() and p.name != ".ipdump-manifest"}
     assert ipdump.export(db, tmp / "data", out) == 0
@@ -157,6 +160,26 @@ def test_ctrl_c_keeps_progress(env, monkeypatch, capsys):
     assert len(json.loads((out / ".ipdump-manifest").read_text())) == 2
     assert not list(out.rglob("*.part"))
     assert ipdump.export(db, tmp / "data", out) == 4  # 3 md + 1 image left, done ones skipped
+
+
+def test_ctrl_c_finishes_current_article(env):
+    db, run, _, _ = env
+    api = FakeAPI([bm(1, "One"), bm(2, "Two"), bm(3, "Three")])
+    parses = []
+
+    def ctrl_c_during_second_parse(req):
+        if req.url.split("?")[0].endswith("/parse"):
+            parses.append(req.url)
+            if len(parses) == 2:
+                signal.raise_signal(signal.SIGINT)
+        return api(req)
+
+    with pytest.raises(KeyboardInterrupt):
+        run(ctrl_c_during_second_parse)
+    assert len(parses) == 2  # third article never started
+    assert db.execute("select count(*) from content").fetchone()[0] == 2
+    assert db.execute("select count(*) from images").fetchone()[0] == 2  # second article's image too
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
 def test_main_ctrl_c_exit_code(tmp_path, monkeypatch):

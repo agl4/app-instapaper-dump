@@ -10,12 +10,14 @@ import mimetypes
 import os
 import random
 import re
+import signal
 import sqlite3
 import sys
 import time
 import unicodedata
 import urllib.request
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -62,10 +64,20 @@ class Throttle:
             if (response.status != 429 and response.status < 500) or attempt == self.tries - 1:
                 break
             wait = _retry_after(response.headers) or min(300, 10 * 2**attempt)
-            print(f"  HTTP {response.status}, retrying in {wait:.0f}s", file=sys.stderr)
+            what = "rate limited" if response.status == 429 else "server error"
+            log(f"  {what} (HTTP {response.status}), cooling down {wait:.0f}s, then retry {attempt + 2}/{self.tries}")
             time.sleep(wait)
         self.last = decode_body(response.body)
         return response
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def _title(b, width=70):
+    t = (b.get("title") or b.get("url") or str(b.get("id"))).strip()
+    return t if len(t) <= width else t[: width - 1] + "…"
 
 
 def _retry_after(headers):
@@ -107,8 +119,8 @@ def sync(db, data: Path, client, throttle: Throttle, max_articles=200):
     counts = Counter()
     try:
         sync_meta(db, client, throttle, counts)
-        sync_articles(db, client, throttle, max_articles, counts)
-        sync_images(db, data, counts)
+        sync_missing_images(db, data, counts)
+        sync_articles(db, data, client, throttle, max_articles, counts)
     finally:
         summary(db, counts)
     return counts
@@ -119,8 +131,8 @@ def summary(db, counts):
         "select count(*), coalesce(sum(json_extract(b.json, '$.liked')), 0) from bookmarks b"
         " left join content c on c.bookmark_id = b.id where b.deleted_at is null and c.bookmark_id is null"
     ).fetchone()
-    print(
-        f"+{counts['new']} new, ~{counts['changed']} changed, -{counts['deleted']} deleted, "
+    log(
+        f"Done: +{counts['new']} new, ~{counts['changed']} changed, -{counts['deleted']} deleted, "
         f"{counts['articles']} articles, {counts['images']} images ({left:,} articles remaining, {liked} liked)"
     )
 
@@ -133,9 +145,12 @@ def sync_meta(db, client, throttle, counts):
             put(db, pending_since=since, pending_offset=0, pending_started=started)
     else:
         offset, started = get(db, "pending_offset"), get(db, "pending_started")
+    log(f"Bookmarks: syncing changes since {iso(since) if since > 1 else 'the beginning'}"
+        + (f", resuming at {offset}" if offset else ""))
     while True:
         page = client.bookmarks.changes(since, limit=PAGE, offset=offset)
         raw = throttle.last.get("bookmarks") or []
+        log(f"  got {len(raw)} bookmarks, {len(page.deleted_ids)} deleted (at {offset + len(raw) + len(page.deleted_ids)})")
         with db:
             for bookmark in raw:
                 upsert(db, bookmark, counts)
@@ -145,11 +160,12 @@ def sync_meta(db, client, throttle, counts):
                 )
                 if cur.rowcount:
                     counts["deleted"] += 1
-                    print(f"- {bid}")
+                    log(f"- {bid}")
             offset += len(raw) + len(page.deleted_ids)
             put(db, pending_offset=offset)
         if len(raw) + len(page.deleted_ids) < PAGE:
             break
+    log("Folders: refreshing")
     client.folders.list()
     with db:
         db.execute("delete from folders")
@@ -169,12 +185,12 @@ def upsert(db, b, counts):
     title = b.get("title") or ""
     if row is None:
         counts["new"] += 1
-        print(f'+ {b["id"]} "{title}"')
+        log(f'+ {b["id"]} "{title}"')
     else:
         old = json.loads(row[0])
         diff = [f"{k} {_short(old.get(k))}→{_short(b.get(k))}" for k in sorted(old | b) if old.get(k) != b.get(k)]
         counts["changed"] += 1
-        print(f'~ {b["id"]} "{title}": {", ".join(diff) or "undeleted"}')
+        log(f'~ {b["id"]} "{title}": {", ".join(diff) or "undeleted"}')
         if old.get("url") != b.get("url"):
             db.execute("delete from content where bookmark_id = ?", (b["id"],))
     db.execute(
@@ -189,25 +205,56 @@ def _short(v):
     return s if len(s) <= 60 else s[:57] + "..."
 
 
-def sync_articles(db, client, throttle, max_articles, counts):
+def sync_articles(db, data, client, throttle, max_articles, counts):
+    """Fetch each article's text, then its images right away, so every step leaves a complete article."""
     sql = (
-        "select b.id from bookmarks b left join content c on c.bookmark_id = b.id"
+        "select b.id, b.json from bookmarks b left join content c on c.bookmark_id = b.id"
         f" where b.deleted_at is null and c.bookmark_id is null {PRIORITY}"
     )
-    if max_articles:
-        sql += f" limit {int(max_articles)}"
-    for (bid,) in db.execute(sql).fetchall():
-        try:
-            client.bookmarks.parse(bid)
-            row = (bid, json.dumps(throttle.last), None)
-        except (BadRequestError, NotFoundError) as e:
-            row = (bid, None, str(e))
-        except (QuotaExceededError, RateLimitError, ServerError) as e:
-            print(f"stopping article fetch, next run resumes: {e}", file=sys.stderr)
-            return
-        with db:
-            db.execute("insert or replace into content values (?, ?, ?, ?)", (bid, row[1], int(time.time()), row[2]))
-        counts["articles"] += 1
+    todo = db.execute(sql).fetchall()
+    batch = todo[:max_articles] if max_articles else todo
+    liked = sum(bool(json.loads(bj).get("liked")) for _, bj in batch)
+    log(f"Articles: fetching text + images for {len(batch)} ({liked} liked) of {len(todo)} missing")
+    for i, (bid, bj) in enumerate(batch, 1):
+        b = json.loads(bj)
+        prefix = f"  [{i}/{len(batch)}] {'♥ ' if b.get('liked') else ''}{_title(b)}"
+        with finish_first():
+            try:
+                client.bookmarks.parse(bid)
+                parsed = throttle.last
+            except (BadRequestError, NotFoundError) as e:
+                with db:
+                    db.execute("insert or replace into content values (?, ?, ?, ?)", (bid, None, int(time.time()), str(e)))
+                log(f"{prefix}: no text ({e})")
+                continue
+            except (QuotaExceededError, RateLimitError, ServerError) as e:
+                log(f"Articles: stopping, next run resumes ({e})")
+                return
+            with db:
+                db.execute("insert or replace into content values (?, ?, ?, ?)", (bid, json.dumps(parsed), int(time.time()), None))
+            counts["articles"] += 1
+            log(f"{prefix}: {(parsed.get('content') or {}).get('words') or '?'} words, "
+                + fetch_article_images(db, data, parsed, b, counts))
+
+
+@contextmanager
+def finish_first():
+    """Hold the first Ctrl-C until the block (one article: text + images) is done; a second aborts at once."""
+    hit = []
+
+    def handler(signum, frame):
+        if hit:
+            raise KeyboardInterrupt
+        hit.append(signum)
+        log("  Ctrl-C: finishing this article first, press again to abort now")
+
+    previous = signal.signal(signal.SIGINT, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    if hit:  # block finished normally (also via continue/return): now stop
+        raise KeyboardInterrupt
 
 
 _IMG_SRC = re.compile(r"""<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)""", re.I)
@@ -221,20 +268,33 @@ def article_images(parsed, base):
     return list(dict.fromkeys(u for u in urls if u.startswith(("http://", "https://"))))
 
 
-def sync_images(db, data, counts):
+def fetch_article_images(db, data, parsed, b, counts):
+    """Download an article's images not fetched before; returns e.g. '5 images (1 failed)'."""
+    new = [u for u in article_images(parsed, b.get("url"))
+           if not db.execute("select 1 from images where url = ?", (u,)).fetchone()]
+    failed = 0
+    for url in new:
+        file, error = fetch_image(data / "images", url)
+        with db:
+            db.execute("insert into images values (?, ?, ?)", (url, file, error))
+        counts["images"] += 1
+        failed += error is not None
+    return f"{len(new)} images" + (f" ({failed} failed)" if failed else "")
+
+
+def sync_missing_images(db, data, counts):
+    """Catch up images an interrupted run left behind."""
     # ponytail: rescans every article body each run; add a per-article "images done" flag if this gets slow
     rows = db.execute(
         "select c.json, b.json from content c join bookmarks b on b.id = c.bookmark_id"
         f" where c.json is not null and b.deleted_at is null {PRIORITY}"
     ).fetchall()
     for cj, bj in rows:
-        for url in article_images(json.loads(cj), json.loads(bj).get("url")):
-            if db.execute("select 1 from images where url = ?", (url,)).fetchone():
-                continue
-            file, error = fetch_image(data / "images", url)
-            with db:
-                db.execute("insert into images values (?, ?, ?)", (url, file, error))
-            counts["images"] += 1
+        b, before = json.loads(bj), counts["images"]
+        with finish_first():
+            done = fetch_article_images(db, data, json.loads(cj), b, counts)
+        if counts["images"] > before:
+            log(f"  catch-up {_title(b)}: {done}")
 
 
 def fetch_image(folder: Path, url: str):
@@ -291,13 +351,16 @@ def export(db, data: Path, out: Path):
         manifest[rel] = digest  # only after the file is fully in place
         written += 1
 
+    # only articles with full text; the rest appear once sync has fetched them
     rows = db.execute(
-        "select b.id, b.json, c.json from bookmarks b left join content c on c.bookmark_id = b.id"
-        " where b.deleted_at is null order by b.id"
+        "select b.id, b.json, c.json from bookmarks b join content c on c.bookmark_id = b.id"
+        " where b.deleted_at is null and json_extract(c.json, '$.content.body') <> '' order by b.id"
     )
+    rows = rows.fetchall()
+    log(f"Export: {len(rows)} articles with full text -> {out}")
     try:
         for bid, bj, cj in rows:
-            b, parsed = json.loads(bj), json.loads(cj) if cj else None
+            b, parsed = json.loads(bj), json.loads(cj)
             year = datetime.fromtimestamp(b.get("time") or 0, timezone.utc).year
             if b.get("archived"):
                 location = "archive"
@@ -320,28 +383,27 @@ def export(db, data: Path, out: Path):
                 for f in images:
                     write(f"{d}/{stem}_files/{f}", data / "images" / f, f)
             count += 1
+            if count % 500 == 0:
+                log(f"  {count}/{len(rows)}, {written} files written")
     finally:  # also on Ctrl-C, so the next run skips what's already written
         out.mkdir(parents=True, exist_ok=True)
         atomic_write(manifest_path, json.dumps(manifest, indent=0, sort_keys=True).encode())
-        print(f"exported {count} articles, wrote {written} files to {out}")
+        log(f"exported {count} articles, wrote {written} files (unchanged ones skipped)")
     return written
 
 
 def render(b, parsed, stem, folders, files):
     """Markdown text for one bookmark, plus {local file: original url} of the images it links."""
-    meta = (parsed or {}).get("metadata") or {}
-    content = (parsed or {}).get("content") or {}
+    meta = parsed.get("metadata") or {}
+    content = parsed["content"]
     images = {}
-    if content.get("body"):
-        soup = BeautifulSoup(content["body"], "html.parser")
-        for img in soup.find_all("img", src=True):
-            url = urljoin(b.get("url") or "", html.unescape(img["src"]).strip())
-            if url in files:
-                img["src"] = f"{stem}_files/{files[url]}"
-                images[files[url]] = url
-        body = markdownify(str(soup), heading_style="ATX").strip()
-    else:
-        body = f"{b.get('description') or ''}\n\n_(article text not synced yet)_".strip()
+    soup = BeautifulSoup(content["body"], "html.parser")
+    for img in soup.find_all("img", src=True):
+        url = urljoin(b.get("url") or "", html.unescape(img["src"]).strip())
+        if url in files:
+            img["src"] = f"{stem}_files/{files[url]}"
+            images[files[url]] = url
+    body = markdownify(str(soup), heading_style="ATX").strip()
 
     author = meta.get("author") if isinstance(meta.get("author"), dict) else {}
     progress = b.get("progress") or {}
@@ -396,7 +458,7 @@ def main(argv=None):
         else:
             export(db, args.data, args.out)
     except KeyboardInterrupt:
-        print("interrupted; progress is saved, run again to continue", file=sys.stderr)
+        log("interrupted; progress is saved, run again to continue")
         sys.exit(130)
     finally:
         db.close()
