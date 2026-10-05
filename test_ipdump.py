@@ -199,14 +199,6 @@ def test_safe():
     assert ipdump.safe("...") == "untitled"
 
 
-def test_image_layout_migrates_flat_files(tmp_path):
-    (tmp_path / "images").mkdir()
-    (tmp_path / "images" / "3f9a1c0b7d2e4a51.jpg").write_bytes(b"x")
-    ipdump.open_db(tmp_path)
-    assert (tmp_path / "images/3f/9a/3f9a1c0b7d2e4a51.jpg").read_bytes() == b"x"
-    assert not (tmp_path / "images" / "3f9a1c0b7d2e4a51.jpg").exists()
-
-
 def test_language():
     assert ipdump.language("The quick brown fox jumps over the lazy dog and runs into the forest.") == "en"
     assert ipdump.language("Árvíztűrő tükörfúrógép, a magyar nyelv nagyon szép és gazdag.") == "hu"

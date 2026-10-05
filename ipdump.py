@@ -99,10 +99,6 @@ def image_path(data: Path, name: str) -> Path:
 
 def open_db(data: Path) -> sqlite3.Connection:
     (data / "images").mkdir(parents=True, exist_ok=True)
-    for old in (data / "images").glob("*.*"):  # one-time move from the old flat layout
-        if old.is_file():
-            image_path(data, old.name).parent.mkdir(parents=True, exist_ok=True)
-            os.replace(old, image_path(data, old.name))
     db = sqlite3.connect(data / "instapaper.db")
     db.executescript(SCHEMA)
     return db
