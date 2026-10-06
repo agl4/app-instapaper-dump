@@ -28,8 +28,12 @@ from instapaper._transport import decode_body, urllib_transport
 import langdetect.detector_factory as langdetect_factory
 from langdetect import DetectorFactory, LangDetectException
 from instapaper.errors import (
+    AuthenticationError,
     BadRequestError,
+    InstapaperConnectionError,
+    InstapaperError,
     NotFoundError,
+    PermissionDeniedError,
     QuotaExceededError,
     RateLimitError,
     ServerError,
@@ -63,13 +67,20 @@ class Throttle:
 
     def __call__(self, request):
         for attempt in range(self.tries):
+            last_try = attempt == self.tries - 1
             time.sleep(random.uniform(*self.delay))
-            response = self.send(request)
-            if (response.status != 429 and response.status < 500) or attempt == self.tries - 1:
-                break
-            wait = _retry_after(response.headers) or min(300, 10 * 2**attempt)
-            what = "rate limited" if response.status == 429 else "server error"
-            log(f"  {what} (HTTP {response.status}), cooling down {wait:.0f}s, then retry {attempt + 2}/{self.tries}")
+            try:
+                response = self.send(request)
+            except InstapaperConnectionError as e:  # reset, timeout, DNS: retry like a 5xx
+                if last_try:
+                    raise
+                what, wait = f"connection problem ({e.__cause__ or e})", min(300, 10 * 2**attempt)
+            else:
+                if (response.status != 429 and response.status < 500) or last_try:
+                    break
+                wait = _retry_after(response.headers) or min(300, 10 * 2**attempt)
+                what = f"{'rate limited' if response.status == 429 else 'server error'} (HTTP {response.status})"
+            log(f"  {what}, cooling down {wait:.0f}s, then retry {attempt + 2}/{self.tries}")
             time.sleep(wait)
         self.last = decode_body(response.body)
         return response
@@ -513,6 +524,24 @@ def render(b, parsed, stem, folders, files):
 # ---------- cli ----------
 
 
+def diagnose(e):
+    """Turn an API failure into what it most likely means for the account."""
+    if isinstance(e, AuthenticationError):
+        return ("Instapaper rejected the token (401). It was revoked or regenerated, or access to the "
+                "account was blocked. Generate a new token on your application's page; if that fails "
+                "too, sign in at instapaper.com to check the account.")
+    if isinstance(e, PermissionDeniedError):
+        return (f"Instapaper refused access (403: {e.message}). 'Application is suspended' means the app "
+                "was blocked: contact Instapaper support, retrying won't help.")
+    if isinstance(e, RateLimitError):
+        return "still rate limited after every retry (429). Wait an hour or more before syncing again."
+    if isinstance(e, InstapaperConnectionError):
+        return (f"Instapaper kept dropping the connection after every retry ({e}). If instapaper.com "
+                "loads in a browser but this persists, this IP is probably blocked for a while; "
+                "wait a few hours, then sync with a longer --delay.")
+    return str(e)
+
+
 def main(argv=None):
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data", type=Path, default=Path.home() / ".local/share/ipdump", help="database + image cache")
@@ -536,6 +565,9 @@ def main(argv=None):
     except KeyboardInterrupt:
         log("interrupted; progress is saved, run again to continue")
         sys.exit(130)
+    except InstapaperError as e:  # nothing is lost either way: every finished step is saved
+        log(f"error: {diagnose(e)}\nprogress is saved; run again once that is resolved")
+        sys.exit(1)
     finally:
         db.close()
 

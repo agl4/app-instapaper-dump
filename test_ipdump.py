@@ -123,6 +123,23 @@ def test_full_import_reads_every_list_and_resumes(env, capsys):
     assert api.list_calls == []  # only once; later syncs use the change feed
 
 
+def test_connection_reset_is_retried(env, capsys):
+    db, run, sleeps, _ = env
+    api = FakeAPI([bm(1, "One")])
+    resets = [1, 1]
+
+    def flaky(req):
+        if resets:
+            resets.pop()
+            raise InstapaperConnectionError("Could not reach Instapaper: reset")
+        return api(req)
+
+    run(flaky)
+    assert "connection problem" in capsys.readouterr().out
+    assert sleeps.count(10) == 1 and sleeps.count(20) == 1  # backoff 10s, 20s
+    assert db.execute("select count(*) from bookmarks").fetchone()[0] == 1
+
+
 def test_rate_limit_retry(env):
     _, run, sleeps, _ = env
     api = FakeAPI([bm(1, "One")])

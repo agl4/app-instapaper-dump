@@ -30,11 +30,29 @@ One personal access token for your own account:
    and create an application (any name, e.g. "my export").
 2. Open it and select **Generate access token**. It is shown only once; regenerating or revoking it
    on the same page disables the old one.
-3. Provide it via the environment:
+3. Provide it as `INSTAPAPER_TOKEN`. ipdump only reads the environment, so pick one of:
+
+   **A `.env` file** in the project folder (already in `.gitignore`):
 
    ```sh
-   export INSTAPAPER_TOKEN=...
+   echo 'INSTAPAPER_TOKEN=your-token' > .env
+   chmod 600 .env
+   uv run --env-file .env ipdump sync
    ```
+
+   To skip `--env-file` on every run, set `UV_ENV_FILE=.env` once in your shell
+   (fish: `set -Ux UV_ENV_FILE .env`).
+
+   **The macOS Keychain**, so the token never sits in a file:
+
+   ```sh
+   security add-generic-password -s instapaper -a "$USER" -w 'your-token'
+   export INSTAPAPER_TOKEN="$(security find-generic-password -s instapaper -w)"
+   ```
+
+   Put the second line in your shell config (fish:
+   `set -gx INSTAPAPER_TOKEN (security find-generic-password -s instapaper -w)` in
+   `~/.config/fish/config.fish`).
 
 Keep the token private, and don't commit it. Article text is free for **personal use** only (the
 developer who registered the application reads their own account), per the
