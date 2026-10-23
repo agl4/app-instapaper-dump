@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import html
 import json
 import mimetypes
 import os
@@ -325,14 +324,16 @@ def finish_first():
         raise KeyboardInterrupt
 
 
-_IMG_SRC = re.compile(r"""<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)""", re.I)
+def body_images(soup, base):
+    """(img tag, absolute URL) for every <img src>; sync and export both use this so they agree."""
+    return [(img, urljoin(base or "", img["src"].strip())) for img in soup.find_all("img", src=True)]
 
 
 def article_images(parsed, base):
     """Absolute image URLs: <img src> in body order, then content.images."""
     c = parsed.get("content") or {}
-    srcs = [html.unescape(s) for s in _IMG_SRC.findall(c.get("body") or "")] + list(c.get("images") or [])
-    urls = (urljoin(base or "", s.strip()) for s in srcs)
+    body = [u for _, u in body_images(BeautifulSoup(c.get("body") or "", "html.parser"), base)]
+    urls = body + [urljoin(base or "", s.strip()) for s in c.get("images") or []]
     return list(dict.fromkeys(u for u in urls if u.startswith(("http://", "https://"))))
 
 
@@ -351,7 +352,9 @@ def fetch_article_images(db, data, parsed, b, counts):
 
 
 def sync_missing_images(db, data, counts):
-    """Catch up images an interrupted run left behind."""
+    """Catch up images an interrupted run left behind, and retry failures that may be transient."""
+    with db:  # 4xx and non-images are permanent; timeouts, resets, 5xx get another go
+        db.execute("delete from images where error not like 'HTTP Error 4%' and error not like 'not an image%'")
     # ponytail: rescans every article body each run; add a per-article "images done" flag if this gets slow
     rows = db.execute(
         "select c.json, b.json from content c join bookmarks b on b.id = c.bookmark_id"
@@ -373,6 +376,8 @@ def fetch_image(data: Path, url: str):
             body, ctype = r.read(), r.headers.get_content_type()
     except Exception as e:  # any third-party failure is just recorded
         return None, str(e) or type(e).__name__
+    if ctype in ("text/html", "application/xhtml+xml", "application/json"):  # error/login page served as 200
+        return None, f"not an image ({ctype})"
     suffix = Path(urlparse(url).path).suffix.lower()
     ext = (mimetypes.guess_extension(ctype) if ctype.startswith("image/") else None) or (
         suffix if re.fullmatch(r"\.[a-z0-9]{1,5}", suffix) else ".bin"
@@ -484,8 +489,7 @@ def render(b, parsed, stem, folders, files):
     content = parsed["content"]
     images = {}
     soup = BeautifulSoup(content["body"], "html.parser")
-    for img in soup.find_all("img", src=True):
-        url = urljoin(b.get("url") or "", html.unescape(img["src"]).strip())
+    for img, url in body_images(soup, b.get("url")):
         if url in files:
             img["src"] = f"{stem}_files/{files[url]}"
             images[files[url]] = url

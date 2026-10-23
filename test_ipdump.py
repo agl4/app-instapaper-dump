@@ -1,5 +1,6 @@
 import json
 import signal
+from email.message import Message
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -252,3 +253,37 @@ def test_language():
     assert ipdump.language("Der schnelle braune Fuchs springt über den faulen Hund.") == "de"
     assert ipdump.language("Le renard brun rapide saute par-dessus le chien paresseux.") == "fr"
     assert ipdump.language(" 1234 ") is None
+
+
+def test_sync_and_export_agree_on_images(tmp_path):
+    body = '<img data-src="/lazy.jpg" src="/real.jpg"><img src="/q?a=1&amp;copy=2">'
+    parsed = {"content": {"body": body, "images": []}}
+    b = bm(1, "T")
+    urls = ipdump.article_images(parsed, b["url"])
+    assert urls == ["https://ex.com/real.jpg", "https://ex.com/q?a=1&copy=2"]
+    text, images = ipdump.render(b, parsed, "s", {}, {u: f"{i}.jpg" for i, u in enumerate(urls)})
+    assert images == {"0.jpg": urls[0], "1.jpg": urls[1]} and "s_files/1.jpg" in text
+
+
+def test_transient_image_failures_are_retried(env, monkeypatch):
+    db, run, _, tmp_path = env
+    run(FakeAPI([bm(1, "A"), bm(2, "B"), bm(3, "C")]))
+    db.execute("update images set file = null, error = 'timed out' where url like '%pic1%'")
+    db.execute("update images set file = null, error = 'HTTP Error 404: Not Found' where url like '%pic2%'")
+    db.execute("update images set file = null, error = 'not an image (text/html)' where url like '%pic3%'")
+    fetched = []
+    monkeypatch.setattr(ipdump, "fetch_image", lambda data, url: fetched.append(url) or ("x.jpg", None))
+    ipdump.sync_missing_images(db, tmp_path / "data", ipdump.Counter())
+    assert fetched == ["https://ex.com/pic1.jpg"]
+
+
+def test_fetch_image_rejects_html(tmp_path, monkeypatch):
+    class R:
+        headers = Message()
+        headers["Content-Type"] = "text/html; charset=utf-8"
+        __enter__ = lambda self: self
+        __exit__ = lambda self, *a: None
+        read = lambda self: b"<html>login</html>"
+
+    monkeypatch.setattr(ipdump.urllib.request, "urlopen", lambda *a, **kw: R())
+    assert ipdump.fetch_image(tmp_path, "https://ex.com/a.jpg") == (None, "not an image (text/html)")
