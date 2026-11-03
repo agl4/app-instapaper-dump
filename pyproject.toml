@@ -10,6 +10,7 @@ dependencies = [
     "instapaper-api>=1.0.0",
     "langdetect>=1.0.9",
     "markdownify>=1.2.3",
+    "trafilatura>=2.3.1",
 ]
 
 [project.scripts]

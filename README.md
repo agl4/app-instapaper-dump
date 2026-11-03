@@ -2,16 +2,19 @@
 
 Mirror your Instapaper account locally and export it as plain Markdown files with local images.
 
-- **sync** incrementally downloads bookmark metadata, article text and images into a local SQLite
-  database. It is throttled (random 1–6 s between API calls, backoff on rate limits) and resumable,
-  and it prints what changed since the last run. Liked articles are fetched first.
+- **sync** incrementally downloads bookmark metadata from Instapaper, then the articles and images from
+  the original websites, cleaned down to the article, into a local SQLite database. Instapaper's own copy
+  is only requested for articles the web can't provide, such as paywalled or removed ones. It is
+  throttled (random 1–6 s between API calls with backoff on rate limits, 1–3 s between web pages, 50–250 ms between images)
+  and resumable, and it prints what changed since the last run. Liked articles are fetched first.
 - **export** writes one Markdown file per article that has its full text synced, with YAML front matter and images alongside,
   mirroring Instapaper: `home/`, `archive/`, one dir per folder, plus copies of liked articles in
   `liked/`, each grouped by year.
 
 Built on the [Instapaper API v2](https://www.instapaper.com/developers) and the official
 [`instapaper-api`](https://pypi.org/project/instapaper-api/) SDK. Read-only: it never changes
-anything in your Instapaper account. See [SPEC.md](SPEC.md) for the details.
+anything in your Instapaper account. Article cleanup uses [trafilatura](https://trafilatura.readthedocs.io/).
+See [SPEC.md](SPEC.md) for the details.
 
 ## Install
 
@@ -61,20 +64,39 @@ developer who registered the application reads their own account), per the
 ## Use
 
 ```sh
-uv run ipdump sync                    # metadata + up to 200 article texts + their images
+uv run ipdump sync                    # metadata + up to 200 web articles + up to 200 from Instapaper
 uv run ipdump sync --max-articles 0   # no cap; a huge archive can take many hours
+uv run ipdump sync --full-import      # also read every list, for bookmarks older than the change feed
 uv run ipdump export                  # Markdown into ./export
 uv run ipdump export --out ~/Notes/instapaper
 ```
 
 Run `sync` as often as you like (e.g. daily from cron). Each run only fetches what changed, and an
 interrupted run (Ctrl-C, crash, network loss) resumes where it stopped. Ctrl-C lets the
-current article finish (text + images) before stopping; press it twice to stop immediately. Repeat `export` runs only write files that changed. The
+current article finish (text + images) before stopping; press it twice to stop immediately.
+
+A plain `sync` only sees Instapaper's change feed, which in practice misses bookmarks saved before
+about 2025. `--full-import` reads every list to get them, at the cost of many API calls, so use it for
+the first run if you want the whole account, then weekly at most. If it gets rate limited, the next
+`--full-import` resumes it; plain syncs in between don't touch it.
+
+Repeat `export` runs only write files that changed. The
 export never deletes anything, so to drop articles you deleted, unliked or moved, delete the
 export directory and export again.
 
 Data lives in `~/.local/share/ipdump/` (`instapaper.db` and `images/`); override with `--data DIR`.
-`--delay LO HI` changes the wait between API calls.
+`--delay LO HI` changes the wait between Instapaper API calls; web pages always wait 1–3 s and images 50–250 ms.
+
+## Limits of the web download
+
+- A soft paywall with a long teaser and no paywall marker is saved as complete, so Instapaper is never
+  asked for that article.
+- An article under 150 words costs one API call, because it might be a stub. The longer version is kept.
+- Pages that need JavaScript to render use Instapaper's copy, or are recorded as failed if it has none.
+- Many large publishers return 403 despite the browser `User-Agent`. Those use Instapaper's copy too, so
+  a high block rate means more API calls.
+- An article that neither source can provide is not retried.
+- Author names on web articles come from page metadata and are sometimes wrong.
 
 ## Development
 

@@ -38,9 +38,16 @@ from instapaper.errors import (
     ServerError,
 )
 from markdownify import markdownify
+import trafilatura
 
 PAGE = 500
-UA = "Mozilla/5.0 (ipdump)"
+# sites only: API calls keep the SDK's own header
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+WEB_DELAY = (1.0, 3.0)  # seconds before every page download; --delay is only for the API
+IMAGE_DELAY = (0.05, 0.25)  # seconds before every image download
+MAX_PAGE = 20 * 1024 * 1024
+MIN_WORDS = 150  # below this a page is probably a stub, so Instapaper gets asked for its copy
+PAYWALL = re.compile(rb"""["']?isAccessibleForFree["']?\s*:\s*["']?false""", re.I)
 # languages the user reads, most likely first: a prior that only tips close calls; others still detectable
 LANGUAGE_PRIOR = {"en": 8, "hu": 4, "de": 2}
 CATEGORIES = {0: "article", 1: "email", 2: "video", 3: "pdf", 4: "social"}
@@ -133,14 +140,23 @@ def atomic_write(path: Path, payload: bytes):
     os.replace(tmp, path)
 
 
-def sync(db, data: Path, client, throttle: Throttle, max_articles=200):
+def sync(db, data: Path, client, throttle: Throttle, max_articles=200, full=False):
     # Every page/article/image is its own transaction, so Ctrl-C loses at most the item in flight.
     counts = Counter()
+    meta_error = None
     try:
-        full_import(db, client, throttle, counts)
-        sync_meta(db, client, throttle, counts)
+        try:
+            if full:
+                full_import(db, client, throttle, counts)
+            sync_meta(db, client, throttle, counts)
+        except InstapaperError as e:  # the web doesn't care: download what we have links for
+            meta_error = e
+            log(f"Bookmarks: stopped ({e}), downloading from the links already known")
         sync_missing_images(db, data, counts)
-        sync_articles(db, data, client, throttle, max_articles, counts)
+        sync_web_articles(db, data, max_articles, counts)
+        if meta_error:  # the Instapaper pass would only hit the same problem
+            raise meta_error
+        sync_api_articles(db, data, client, throttle, max_articles, counts)
     finally:
         summary(db, counts)
     return counts
@@ -151,9 +167,14 @@ def summary(db, counts):
         "select count(*), coalesce(sum(json_extract(b.json, '$.liked')), 0) from bookmarks b"
         " left join content c on c.bookmark_id = b.id where b.deleted_at is null and c.bookmark_id is null"
     ).fetchone()
+    waiting = db.execute(
+        "select count(*) from content c join bookmarks b on b.id = c.bookmark_id"
+        " where b.deleted_at is null and c.error like 'web:%'"
+    ).fetchone()[0]
     log(
         f"Done: +{counts['new']} new, ~{counts['changed']} changed, -{counts['deleted']} deleted, "
-        f"{counts['articles']} articles, {counts['images']} images ({left:,} articles remaining, {liked} liked)"
+        f"{counts['articles']} articles from the web, {counts['api']} from Instapaper, {counts['images']} images "
+        f"({left:,} articles remaining, {liked} liked, {waiting:,} waiting for Instapaper)"
     )
 
 
@@ -203,14 +224,13 @@ def refresh_folders(db, client, throttle):
 
 
 def full_import(db, client, throttle, counts):
-    """One-time import of every bookmark by paging home, archive and each folder.
+    """Import of every bookmark by paging home, archive and each folder (sync --full-import).
 
     The `since` change feed only returns bookmarks with recorded changes (in practice ~2025 on),
-    not the whole account, so the first sync reads every list; later syncs use the feed.
+    not the whole account, so only this reads older bookmarks. It is many API calls, so it runs on
+    request; an interrupted one resumes on the next request, a finished one starts over.
     Every bookmark is in exactly one of these lists; liked is just a flag.
     """
-    if get(db, "import_done"):
-        return
     if get(db, "import_started") is None:
         refresh_folders(db, client, throttle)
         with db:
@@ -240,7 +260,6 @@ def full_import(db, client, throttle, counts):
         if get(db, "since") is None:  # first ever sync: the feed only needs changes made during the import
             put(db, since=max(1, get(db, "import_started") - 60))
         db.execute("delete from state where key like 'import_%'")
-        put(db, import_done=1)
 
 
 def upsert(db, b, counts, quiet=False):
@@ -272,8 +291,72 @@ def _short(v):
     return s if len(s) <= 60 else s[:57] + "..."
 
 
-def sync_articles(db, data, client, throttle, max_articles, counts):
-    """Fetch each article's text, then its images right away, so every step leaves a complete article."""
+def web_wait(delay=WEB_DELAY):
+    # ponytail: sequential; add a thread pool if a full-archive run is too slow
+    time.sleep(random.uniform(*delay))
+
+
+def fetch_page(url):
+    """Download a web page. Returns (html bytes, URL after redirects); raises on anything unusable."""
+    if not (url or "").startswith(("http://", "https://")):  # urlopen would happily read file://
+        raise ValueError(f"not a web URL ({url})")
+    web_wait()
+    request = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(request, timeout=30) as r:
+        ctype = r.headers.get_content_type()
+        if ctype not in ("text/html", "application/xhtml+xml"):
+            raise ValueError(f"not html ({ctype})")
+        return r.read(MAX_PAGE), r.geturl()
+
+
+def clean_article(html, url):
+    """Strip a page down to its article, in the same shape as an Instapaper parse response."""
+    body = trafilatura.extract(html, url=url, output_format="html", include_images=True, include_links=True,
+                               include_tables=True, include_formatting=True)
+    if not body:
+        raise ValueError("no article text")
+    soup = BeautifulSoup(body, "html.parser")
+    for table in reversed(soup.find_all("table")):  # layout tables: else the whole article lands in one Markdown cell
+        if len(table.find_all(["td", "th"])) == 1:
+            for tag in [table, *table.find_all(["tbody", "tr", "td", "th"])]:
+                tag.unwrap()
+    for img, absolute in body_images(soup, url):
+        img["src"] = absolute
+    for a in soup.find_all("a", href=True):
+        a["href"] = urljoin(url, a["href"].strip())
+    meta = trafilatura.extract_metadata(html, default_url=url)
+    date = meta.date if meta else None
+    root = soup.body or soup
+    return {
+        "metadata": {
+            "author": {"name": meta.author if meta else None},
+            "pubtime": int(datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()) if date else None,
+        },
+        "content": {"body": root.decode_contents().strip(), "images": [], "words": len(root.get_text(" ").split())},
+        "source": "web",
+    }
+
+
+def incomplete_reason(html, words):
+    """Why this download may not be the whole article, or None. Paywalled pages still answer 200."""
+    # ponytail: heuristic; soft paywalls with a long teaser and no JSON-LD marker pass as complete
+    if PAYWALL.search(html):
+        return "paywalled"
+    return f"too short ({words} words)" if words < MIN_WORDS else None
+
+
+def store_content(db, bid, parsed, error):
+    with db:
+        db.execute("insert or replace into content values (?, ?, ?, ?)",
+                   (bid, json.dumps(parsed) if parsed else None, int(time.time()), error))
+
+
+def _words(parsed):
+    return ((parsed or {}).get("content") or {}).get("words") or 0
+
+
+def sync_web_articles(db, data, max_articles, counts):
+    """Download and clean each article, then its images. What the web can't provide is flagged `web: ...`."""
     sql = (
         "select b.id, b.json from bookmarks b left join content c on c.bookmark_id = b.id"
         f" where b.deleted_at is null and c.bookmark_id is null {PRIORITY}"
@@ -281,27 +364,53 @@ def sync_articles(db, data, client, throttle, max_articles, counts):
     todo = db.execute(sql).fetchall()
     batch = todo[:max_articles] if max_articles else todo
     liked = sum(bool(json.loads(bj).get("liked")) for _, bj in batch)
-    log(f"Articles: fetching text + images for {len(batch)} ({liked} liked) of {len(todo)} missing")
+    log(f"Articles: downloading {len(batch)} ({liked} liked) of {len(todo)} missing from the web")
     for i, (bid, bj) in enumerate(batch, 1):
         b = json.loads(bj)
+        prefix = f"  [{i}/{len(batch)}] {'♥ ' if b.get('liked') else ''}{_title(b)}"
+        with finish_first():
+            try:
+                html, url = fetch_page(b.get("url"))
+                parsed = clean_article(html, url)
+            except Exception as e:  # any third-party failure is just recorded
+                store_content(db, bid, None, f"web: {e or type(e).__name__}")
+                log(f"{prefix}: {e or type(e).__name__}, leaving for Instapaper")
+                continue
+            reason = incomplete_reason(html, _words(parsed))
+            store_content(db, bid, parsed, f"web: {reason}" if reason else None)
+            counts["articles"] += 1
+            log(f"{prefix}: {_words(parsed)} words, " + fetch_article_images(db, data, parsed, b, counts)
+                + (f", {reason}, leaving for Instapaper" if reason else ""))
+
+
+def sync_api_articles(db, data, client, throttle, max_articles, counts):
+    """Ask Instapaper only for what the web pass flagged; a stub is kept unless its copy is longer."""
+    sql = (
+        "select b.id, b.json, c.json from bookmarks b join content c on c.bookmark_id = b.id"
+        f" where b.deleted_at is null and c.error like 'web:%' {PRIORITY}"
+    )
+    todo = db.execute(sql).fetchall()
+    batch = todo[:max_articles] if max_articles else todo
+    log(f"Instapaper: fetching {len(batch)} of {len(todo)} articles the web couldn't provide")
+    for i, (bid, bj, cj) in enumerate(batch, 1):
+        b, stub = json.loads(bj), json.loads(cj) if cj else None
         prefix = f"  [{i}/{len(batch)}] {'♥ ' if b.get('liked') else ''}{_title(b)}"
         with finish_first():
             try:
                 client.bookmarks.parse(bid)
                 parsed = throttle.last
             except (BadRequestError, NotFoundError) as e:
-                with db:
-                    db.execute("insert or replace into content values (?, ?, ?, ?)", (bid, None, int(time.time()), str(e)))
+                store_content(db, bid, stub, f"instapaper: {e}")
                 log(f"{prefix}: no text ({e})")
                 continue
             except (QuotaExceededError, RateLimitError, ServerError) as e:
-                log(f"Articles: stopping, next run resumes ({e})")
+                log(f"Instapaper: stopping, next run resumes ({e})")
                 return
-            with db:
-                db.execute("insert or replace into content values (?, ?, ?, ?)", (bid, json.dumps(parsed), int(time.time()), None))
-            counts["articles"] += 1
-            log(f"{prefix}: {(parsed.get('content') or {}).get('words') or '?'} words, "
-                + fetch_article_images(db, data, parsed, b, counts))
+            best = parsed if _words(parsed) > _words(stub) or not stub else stub
+            store_content(db, bid, best, None)
+            counts["api"] += best is parsed
+            log(f"{prefix}: {_words(best)} words" + ("" if best is parsed else " (kept the web copy)") + ", "
+                + fetch_article_images(db, data, best, b, counts))
 
 
 @contextmanager
@@ -371,6 +480,7 @@ def sync_missing_images(db, data, counts):
 def fetch_image(data: Path, url: str):
     """Download to image_path(<sha256(url)[:16]>.<ext>). Returns (file name, None) or (None, error)."""
     try:
+        web_wait(IMAGE_DELAY)
         request = urllib.request.Request(url, headers={"User-Agent": UA})
         with urllib.request.urlopen(request, timeout=30) as r:
             body, ctype = r.read(), r.headers.get_content_type()
@@ -552,8 +662,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="ipdump", description="Mirror Instapaper locally and export Markdown.")
     sub = parser.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("sync", parents=[common], help="incremental sync (needs INSTAPAPER_TOKEN)")
-    s.add_argument("--max-articles", type=int, default=200, help="article texts per run, 0 = all")
-    s.add_argument("--delay", type=float, nargs=2, default=(1.0, 6.0), metavar=("LO", "HI"), help="seconds between API calls")
+    s.add_argument("--max-articles", type=int, default=200, help="articles per run for each of web and Instapaper, 0 = all")
+    s.add_argument("--delay", type=float, nargs=2, default=(1.0, 6.0), metavar=("LO", "HI"), help="seconds between Instapaper API calls (web pages always wait 1-3 s, images 50-250 ms)")
+    s.add_argument("--full-import", action="store_true", help="also read every list, for bookmarks the change feed doesn't have; many API calls, weekly is plenty")
     e = sub.add_parser("export", parents=[common], help="write Markdown files")
     e.add_argument("--out", type=Path, default=Path("export"))
     args = parser.parse_args(argv)
@@ -563,7 +674,7 @@ def main(argv=None):
         if args.cmd == "sync":
             token = os.environ.get("INSTAPAPER_TOKEN") or parser.error("set INSTAPAPER_TOKEN")
             throttle = Throttle(tuple(args.delay))
-            sync(db, args.data, Instapaper(token, transport=throttle), throttle, args.max_articles)
+            sync(db, args.data, Instapaper(token, transport=throttle), throttle, args.max_articles, args.full_import)
         else:
             export(db, args.data, args.out)
     except KeyboardInterrupt:

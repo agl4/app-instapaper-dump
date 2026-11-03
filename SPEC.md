@@ -11,8 +11,8 @@ Facts from the spec and SDK source (verified):
 - `GET /bookmarks?since=<ts>` returns every change across the whole account plus `deleted_ids`.
   The limit is ≤ 500; paging uses `offset += len(bookmarks)+len(deleted_ids)` and stops on a short page.
   The docs say `since=1` returns the whole account, but in practice the feed only holds bookmarks
-  with recorded changes (on a ~24k account it returned 1,325, almost all saved 2025–26). So the
-  first sync is a full import over the section lists instead (see Sync step 0).
+  with recorded changes (on a ~24k account it returned 1,325, almost all saved 2025–26). So
+  older bookmarks need a full import over the section lists (see Sync step 0).
 - SDK `client.bookmarks.changes(since, limit, offset)` fetches one page. Use it instead of `sync()`,
   which buffers the whole account in memory and can't resume.
 - Bookmarks have no `updated_at`, so changes are detected by diffing against the stored JSON.
@@ -38,45 +38,58 @@ test_ipdump.py   # fake transport, no network
 ```
 Data dir: `~/.local/share/ipdump/` (`--data`), containing `instapaper.db` and `images/`.
 
-## Storage (raw API data)
+## Storage (raw API data and cleaned web articles)
 - `bookmarks(id PK, json, deleted_at)`: the raw bookmark object from the change feed
-- `content(bookmark_id PK, json, fetched_at, error)`: the raw parse response
+- `content(bookmark_id PK, json, fetched_at, error)`: a raw parse response, or a cleaned web article in
+  the same shape with `"source": "web"`. `content.body` is HTML either way. `error` is `web: <reason>` while
+  an article waits for the Instapaper pass, and `instapaper: <reason>` once neither source can do better.
 - `folders(id PK, json)`
 - `images(url PK, file, error)`: `file` is the name `<sha256(url)[:16]>.<ext>`. The file lives on
   disk, not in the DB, sharded squid-style as `images/<ab>/<cd>/<abcd…>.<ext>` (first two hex pairs),
   so no directory holds more than a few files even for hundreds of thousands of images.
 - `state(key PK, value)`: `since`, `pending_since`, `pending_offset`, `pending_started`,
-  `import_done`, `import_started`, `import_index`, `import_offset`
+  `import_started`, `import_index`, `import_offset`
 
-## Sync: `uv run ipdump sync [--max-articles N] [--delay LO HI]`
-**Throttled transport** wraps the SDK's `urllib_transport`. Before each API request it sleeps for
+## Sync: `uv run ipdump sync [--max-articles N] [--delay LO HI] [--full-import]`
+**Rate limits.** Web pages sleep a random 1–3 s first (`WEB_DELAY`), and images 50–250 ms (`IMAGE_DELAY`). The rest of this
+paragraph applies only to Instapaper. **Throttled transport** wraps the SDK's `urllib_transport`. Before each API request it sleeps for
 `random.uniform(1, 6)` seconds (overridable with `--delay`). On 429 or 5xx it waits for `Retry-After`,
 or backs off exponentially up to 300 s, for at most ~6 tries. After that it returns the response so
 the SDK raises the typed error.
 
-0. **Full import (once).** Until `import_done` is set, page through `GET /bookmarks?section=home`,
+0. **Full import (only with `--full-import`, weekly is plenty).** Page through `GET /bookmarks?section=home`,
    `section=archive`, and `folder_id=<id>` for every folder, 500 at a time, driven by `total`. Every
    bookmark is in exactly one of these lists; liked is just a flag. Each page is one transaction and
-   the position (`import_index/offset`) is saved, so it resumes. It prints one progress line per page
-   (`home: 1500/12034`), not one per bookmark. On a fresh DB, `since` is then set to the import start
-   minus 60 s so the feed only fetches changes made during the import.
+   the position (`import_index/offset`) is saved, so the next `--full-import` resumes; plain syncs
+   leave it alone. A finished import starts over the next time. It prints one progress line per page
+   (`home: 1500/12034`), not one per bookmark. If `since` isn't set yet, it is then set to the import
+   start minus 60 s so the feed only fetches changes made during the import.
 1. **Metadata.** Resume from `pending_since/offset` if set. Otherwise use `since = state.since or 1`
    and record the start time. Commit each page of `changes(...)` in its own transaction: upsert the
    raw JSON and print one line per new or changed bookmark (the top-level keys that differ, e.g.
    `~ 123 "Title": liked false→true`). Mark `deleted_ids` with `deleted_at`. Save the offset.
    A crash resumes on the next run. When finished, set `since = started - 60` (overlap for clock
    skew) and refresh `folders`.
-2. **Article text.** Process bookmarks that have no content and aren't deleted, **liked first**,
+   An `InstapaperError` here doesn't stop the web pass, which runs on the links already known. The
+   Instapaper pass is skipped and sync exits 1 afterwards.
+2. **Article text from the web.** Process bookmarks that have no content and aren't deleted, **liked first**,
    then newest first (`ORDER BY liked DESC, time DESC` on the stored JSON). Liked articles are the
    most important ones, so they become complete and exportable before the rest of the backlog.
    An article liked later jumps the queue on the next run. Up to `--max-articles` per run (default
-   200, `0` = all), calling `parse(id)` and storing the raw JSON.
-   A 400 or 404 is recorded in `error` and skipped. A 402 or exhausted 429 stops cleanly, and the
-   next run resumes. If a bookmark's `url` changes, its content row is deleted so it gets re-parsed.
-3. **Images, per article.** Right after an article's text is stored, its images are downloaded
+   200, `0` = all). `fetch_page` accepts only `http(s)` URLs and HTML (30 s timeout, 20 MB cap), and
+   `clean_article` extracts the article with `trafilatura`. If a bookmark's `url` changes, its content
+   row is deleted so it gets fetched again.
+   - A failed download is stored as `json = null, error = 'web: <reason>'`.
+   - A page with `isAccessibleForFree: false` or under 150 words is stored as a stub with
+     `error = 'web: <reason>'`. It is exported as it is until something better replaces it.
+3. **Article text from Instapaper.** Only for rows with `error like 'web:%'`, in the same order and with
+   the same cap, calling `parse(id)`. The longer of Instapaper's copy and the stub is kept, and `error` is
+   cleared. A 400 or 404 keeps any stub and sets `error = 'instapaper: <reason>'`, which is final. A 402,
+   exhausted 429 or 5xx stops this pass cleanly, and the next run resumes without downloading the pages again.
+4. **Images, per article.** Right after an article's text is stored, its images are downloaded
    (every URL in `content.images` plus `<img src>` in the body that isn't already in `images`), so
    each step leaves a complete article. This uses plain `urllib` to the third-party hosts with a 30 s
-   timeout and no API throttling. Failures are recorded in `error` and not retried. Before fetching
+   timeout. Failures are recorded in `error` and not retried. Before fetching
    new articles, a catch-up pass downloads images that an interrupted run left behind.
    **Ctrl-C** during an article is held until its text and images are stored, then sync stops;
    a second Ctrl-C aborts at once (the catch-up pass covers that case).
